@@ -1,7 +1,7 @@
 """
 prepare_data.py
 ───────────────
-Downloads TinyStories from HuggingFace, tokenises with tiktoken (o200k_base),
+Downloads TinyStories from HuggingFace, tokenises with tiktoken (gpt2),
 and writes binary shards to  data/train/  and  data/val/.
 
 Each shard is a flat uint32 numpy array saved as  shard_NNNN.npy.
@@ -138,7 +138,7 @@ def main():
     print(f"  train stories : {len(train_ds):,}")
     print(f"  val   stories : {len(val_ds):,}")
 
-    enc = tiktoken.get_encoding("o200k_base")
+    enc = tiktoken.get_encoding("gpt2")
     tokenise = make_tokenise_fn(enc)
 
     print("Tokenising (this takes a few minutes) …")

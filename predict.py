@@ -1,7 +1,7 @@
 """
 predict.py
 ──────────
-Interactive text-generation script for the trained SLM.
+Interactive text-generation script for the trained MoE-LLM.
 
 Usage
 -----
@@ -12,11 +12,11 @@ Usage
     python predict.py
 
     # Custom checkpoint / sampling params
-    python predict.py \\
-        --ckpt  checkpoints/step_0010000.pt \\
-        --prompt "The little dragon" \\
-        --max_new_tokens 300 \\
-        --temperature 0.8 \\
+    python predict.py \
+        --ckpt  checkpoints/step_0010000.pt \
+        --prompt "The little dragon" \
+        --max_new_tokens 300 \
+        --temperature 0.8 \
         --top_k 50
 
 Options
@@ -25,7 +25,7 @@ Options
     --prompt          input text  (if omitted, enter interactive REPL)
     --max_new_tokens  tokens to generate (default 200)
     --temperature     sampling temperature  1.0 = neutral, <1 sharper, >1 random
-    --top_k           restrict to top-k tokens (0 = disabled, i.e. greedy argmax)
+    --top_k           restrict to top-k tokens (0 = disabled, i.e. full distribution)
     --device          cpu / cuda / mps  (auto-detected if omitted)
     --dtype           bfloat16 | float16 | float32
 """
@@ -37,30 +37,12 @@ from pathlib import Path
 import tiktoken
 import torch
 
-from model import Modelcfg, SLM
-
-# ── PyTorch / XLA detection (TPU) ─────────────────────────────────────────────
-try:
-    import torch_xla.core.xla_model as xm
-    _XLA_AVAILABLE = True
-except ImportError:
-    xm = None
-    _XLA_AVAILABLE = False
-
-
-def on_tpu() -> bool:
-    if not _XLA_AVAILABLE:
-        return False
-    try:
-        return xm.device_type().lower() == "tpu"
-    except Exception:
-        return False
-
+from config_model import ModelConfig
+from model import LLM, generate
 
 # ── helpers ───────────────────────────────────────────────────────────────────
-
 def get_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate text with the SLM.")
+    p = argparse.ArgumentParser(description="Generate text with the MoE-LLM.")
     p.add_argument("--ckpt",           default="checkpoints/step_0000260.pt")
     p.add_argument("--prompt",         default="",     help="seed text; blank → REPL")
     p.add_argument("--max_new_tokens", type=int,   default=200)
@@ -76,8 +58,6 @@ def get_args() -> argparse.Namespace:
 def detect_device(requested: str) -> torch.device:
     if requested:
         return torch.device(requested)
-    if on_tpu():
-        return xm.xla_device()
     if torch.cuda.is_available():
         return torch.device("cuda")
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -85,7 +65,7 @@ def detect_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model(ckpt_path: Path, device: torch.device, dtype: torch.dtype) -> SLM:
+def load_model(ckpt_path: Path, device: torch.device, dtype: torch.dtype) -> LLM:
     if not ckpt_path.exists():
         sys.exit(
             f"Checkpoint not found: {ckpt_path}\n"
@@ -96,11 +76,11 @@ def load_model(ckpt_path: Path, device: torch.device, dtype: torch.dtype) -> SLM
     state = torch.load(ckpt_path, map_location=device)
 
     # Rebuild config from saved dict so we don't rely on hard-coded defaults
-    cfg = Modelcfg()
-    for k, v in state.get("cfg", {}).items():
-        setattr(cfg, k, v)
+    cfg_dict = state.get("cfg", {})
+    cfg      = ModelConfig(**{k: v for k, v in cfg_dict.items()
+                               if k in ModelConfig.__dataclass_fields__})
 
-    model = SLM(cfg).to(device=device, dtype=dtype)
+    model = LLM(cfg).to(device=device, dtype=dtype)
     # Strip _orig_mod. prefix produced by torch.compile if present
     raw_sd = {k.replace("_orig_mod.", ""): v for k, v in state["model"].items()}
     model.load_state_dict(raw_sd, strict=True)
@@ -111,11 +91,9 @@ def load_model(ckpt_path: Path, device: torch.device, dtype: torch.dtype) -> SLM
     print(f"  val ℒ  : {state.get('val_loss', float('nan')):.4f}")
     return model, cfg
 
-
 # ── generation wrapper ────────────────────────────────────────────────────────
-
 def run_generate(
-    model:          SLM,
+    model:          LLM,
     enc:            tiktoken.Encoding,
     prompt:         str,
     max_new_tokens: int,
@@ -134,12 +112,13 @@ def run_generate(
     prompt_ids = torch.tensor([ids], dtype=torch.long, device=device)   # (1, T)
 
     with torch.no_grad():
-        out_ids = model.predict(
-            idx             = prompt_ids,
-            max_new_tokens  = max_new_tokens,
-            top_k           = top_k if top_k > 0 else None,
-            temp            = temperature,
-            eos_id          = eos_id,
+        out_ids = generate(
+            model          = model,
+            prompt_ids     = prompt_ids,
+            max_new_tokens = max_new_tokens,
+            temperature    = temperature,
+            top_k          = top_k,
+            eos_token_id   = eos_id,
         )
 
     # Decode only the newly generated tokens
@@ -151,9 +130,6 @@ def run_generate(
 
     return enc.decode(new_ids)
 
-
-# ── main ──────────────────────────────────────────────────────────────────────
-
 def main():
     args   = get_args()
     device = detect_device(args.device)
@@ -161,20 +137,15 @@ def main():
                "float16": torch.float16,
                "bfloat16": torch.bfloat16}[args.dtype]
 
-    # On CPU or MPS, fall back to float32 silently.
-    # TPU (xla) keeps bfloat16 — it is native there; float16 is not supported on TPU.
-    if device.type == "xla":
-        if dtype == torch.float16:
-            print("Note: float16 not supported on TPU; using bfloat16.")
-            dtype = torch.bfloat16
-    elif device.type != "cuda" and dtype != torch.float32:
+    # On CPU or MPS, fall back to float32 silently
+    if device.type != "cuda" and dtype != torch.float32:
         print(f"Note: {args.dtype} not supported on {device.type}; using float32.")
         dtype = torch.float32
 
     ckpt_path = Path(args.ckpt)
     model, cfg = load_model(ckpt_path, device, dtype)
 
-    enc = tiktoken.get_encoding("gpt2")
+    enc = tiktoken.get_encoding("o200k_base")
 
     print(f"\nSampling config: max_new_tokens={args.max_new_tokens} "
           f"temperature={args.temperature}  top_k={args.top_k}\n")

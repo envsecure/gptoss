@@ -1,6 +1,7 @@
 import torch.nn as nn
 import torch
-from model import Modelcfg, SLM
+from model import LLM
+from config_model import ModelConfig
 def model_summary(model: nn.Module, dtype=torch.float32) -> dict:
     """
     Print parameter count and estimated memory usage for a PyTorch model.
@@ -74,8 +75,8 @@ def model_summary(model: nn.Module, dtype=torch.float32) -> dict:
 if __name__ == "__main__":
 
     # Any model — swap in your own
-    cfg=Modelcfg()
-    model = SLM(cfg)
+    cfg=ModelConfig()
+    model = LLM(cfg)
 
     stats = model_summary(model, dtype=torch.float32)
 

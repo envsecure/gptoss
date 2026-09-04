@@ -1,7 +1,7 @@
 """
 prepare_data.py
 ───────────────
-Downloads TinyStories from HuggingFace, tokenises with tiktoken (gpt2),
+Downloads TinyStories from HuggingFace, tokenises with tiktoken (o200k_base),
 and writes binary shards to  data/train/  and  data/val/.
 
 Each shard is a flat uint32 numpy array saved as  shard_NNNN.npy.
@@ -57,9 +57,7 @@ def get_args() -> argparse.Namespace:
                    help="tokenisation worker processes")
     return p.parse_args()
 
-
 # ── tokenisation ──────────────────────────────────────────────────────────────
-
 def make_tokenise_fn(enc: tiktoken.Encoding):
     eos_id = enc.encode_single_token(EOS_TOKEN)
 
@@ -70,9 +68,7 @@ def make_tokenise_fn(enc: tiktoken.Encoding):
 
     return tokenise
 
-
 # ── shard writer ──────────────────────────────────────────────────────────────
-
 def write_shards(
     dataset,
     split_dir:  Path,
@@ -121,9 +117,6 @@ def write_shards(
     (split_dir / "meta.json").write_text(json.dumps(meta, indent=2))
     return meta
 
-
-# ── main ──────────────────────────────────────────────────────────────────────
-
 def main():
     args = get_args()
     shard_size = int(args.shard_size)
@@ -138,7 +131,7 @@ def main():
     print(f"  train stories : {len(train_ds):,}")
     print(f"  val   stories : {len(val_ds):,}")
 
-    enc = tiktoken.get_encoding("gpt2")
+    enc = tiktoken.get_encoding("o200k_base")
     tokenise = make_tokenise_fn(enc)
 
     print("Tokenising (this takes a few minutes) …")

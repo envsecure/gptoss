@@ -1,134 +1,227 @@
 import torch
 import torch.nn as nn
+from typing import List, Optional, Tuple
+
+from config_model import ModelConfig
+from model_parts import Transformer, LayerKVCache
 
 
-class Modelcfg:
-    n_t_layers=8
-    n_heads=4
-    d_model=256
-    vocab=50257
-    context_size=256
-    max_new_tokens=200
+class LLM(nn.Module):
+    """
+    Decoder-only LLM with GQA, RoPE, and Mixture-of-Experts FFN.
 
-class SelfAttention(nn.Module):
-    def __init__(self,d_model,d_out):
+    Supports three operating modes via `use_cache`:
+
+    ┌─────────────────┬───────────────────────────────────────────────────┐
+    │ Mode            │ How to call                                       │
+    ├─────────────────┼───────────────────────────────────────────────────┤
+    │ Training        │ logits, aux = model(ids, use_cache=False)         │
+    │                 │   — no cache allocated, full causal mask          │
+    ├─────────────────┼───────────────────────────────────────────────────┤
+    │ Prefill         │ logits, aux = model(prompt_ids, use_cache=True)   │
+    │                 │   — allocates cache on first call, full causal    │
+    │                 │     mask, fills cache with prompt KVs             │
+    ├─────────────────┼───────────────────────────────────────────────────┤
+    │ Decode          │ logits, _ = model(next_tok, use_cache=True)       │
+    │  (one token)    │   — appends one token to cache each step,         │
+    │                 │     no mask needed (cache order = causality)      │
+    └─────────────────┴───────────────────────────────────────────────────┘
+
+    Call  model.reset_cache()  between independent generation requests.
+    Call  model.build_cache(batch_size, device)  to pre-allocate the cache
+    manually before generation (optional — auto-allocated on first use).
+
+    Attributes
+    ----------
+    kv_caches : List[LayerKVCache] | None
+        One LayerKVCache per transformer layer.  None when cache is inactive.
+
+    Returns
+    -------
+        logits   : (b, T, vocabulary_size)
+        aux_loss : scalar  — sum of MoE load-balance losses across all layers
+    """
+
+    def __init__(self, cfg: ModelConfig):
         super().__init__()
-        self.w_q=nn.Linear(d_model,d_out)
-        self.w_k=nn.Linear(d_model,d_out)
-        self.w_v=nn.Linear(d_model,d_out)
-        self.drop=nn.Dropout(0.1)
+        self.cfg = cfg
 
-    def forward(self,x):
-        
-        q=self.w_q(x)
-        k=self.w_k(x)
-        v=self.w_v(x)
-        d = q.size(-1)
-        attn_scores = (q @ k.transpose(-2, -1)) / (d ** 0.5)
-        B, t, _ = attn_scores.shape
-        mask = torch.tril(torch.ones(t, t, device=x.device, dtype=torch.bool))
-        attn_scores = attn_scores.masked_fill(~mask, float("-inf")) #casual masking
-        attn_mat=torch.softmax(attn_scores,dim=-1)
-        attn_mat=self.drop(attn_mat)
-        return attn_mat@v
-    
-class MultiHeadAttention(nn.Module):
-    def __init__(self,d_model,n_heads):
-        super().__init__()
-        d_heads=d_model//n_heads
-        self.attention=nn.ModuleList(
-            [
-                SelfAttention(d_model,d_heads) for _ in range(n_heads)
-            ]
+        self.embed    = nn.Embedding(cfg.vocabulary_size, cfg.d_model)
+        self.drop     = nn.Dropout(cfg.dropout)
+        self.layers   = nn.ModuleList(
+            [Transformer(cfg) for _ in range(cfg.transformer_blocks)]
         )
-    def forward(self,x):
-        temp=[head(x) for head in self.attention]
-        return torch.cat(temp,-1)
-    
+        self.norm     = nn.RMSNorm(cfg.d_model)
+        self.out_head = nn.Linear(cfg.d_model, cfg.vocabulary_size)
 
-class FeedForward(nn.Module):
-    def __init__(self,d_model):
-        super().__init__()
-        self.l1=nn.Linear(d_model,d_model*4)
-        self.l2=nn.Linear(d_model*4,d_model)
-    def forward(self,x):
-        x=self.l1(x)
-        x=torch.relu(x)
-        x=self.l2(x)
-        return x
+        # Cache — None until build_cache() is called or use_cache=True triggers
+        # auto-allocation on the first forward pass.
+        self.kv_caches: Optional[List[LayerKVCache]] = None
 
-class TransFormer(nn.Module):
+    # ── Cache lifecycle ────────────────────────────────────────────────────────
 
-    def __init__(self,d_model,n_heads):
-        super().__init__()
-        self.norm1=nn.RMSNorm(d_model)
-        self.norm2=nn.RMSNorm(d_model)
-        self.attn=MultiHeadAttention(d_model,n_heads)
-        self.ff=FeedForward(d_model)
-        self.resid_drop1 = nn.Dropout(0.1)
-        self.resid_drop2 = nn.Dropout(0.1)
+    def build_cache(
+        self,
+        batch_size: int,
+        device:     torch.device,
+        dtype:      torch.dtype = torch.float32,
+    ) -> None:
+        """
+        Pre-allocate KV caches for all layers.
 
-    def forward(self,x):
-        temp=x
-        x=self.norm1(x)
-        x=self.attn(x)
-        x=self.resid_drop1(x)
-        temp=temp+x
-        x=self.norm2(temp)
-        x=self.ff(x)
-        x=self.resid_drop2(x)
-        return temp+x
+        Called automatically by forward() when use_cache=True and the cache
+        has not yet been built.  You can call it explicitly beforehand to
+        control dtype or to reset an existing cache with a new batch size.
 
-class SLM(nn.Module):
-    def __init__(self,cfg:Modelcfg):
-        super().__init__()
-        self.cfg=cfg
-        self.val_embed=nn.Embedding(cfg.vocab,cfg.d_model)
-        self.pos_embed=nn.Embedding(cfg.context_size,cfg.d_model)
-        self.embed_drop = nn.Dropout(0.1)
-        self.tflayers=nn.ModuleList([TransFormer(cfg.d_model,cfg.n_heads)for _ in range(cfg.n_t_layers)])
-        self.fnorm=nn.RMSNorm(cfg.d_model)
-        self.out_head=nn.Linear(cfg.d_model,cfg.vocab,bias=False)
-        # Weight tying: share the token-embedding table with the output head (GPT-2 style)
-        self.out_head.weight=self.val_embed.weight
+        Parameters
+        ----------
+        batch_size : int
+        device     : torch.device
+        dtype      : torch.dtype   default float32; use bfloat16 to halve memory
+        """
+        head_dim = self.cfg.d_model // self.cfg.num_heads
+        self.kv_caches = [
+            LayerKVCache(
+                batch_size   = batch_size,
+                num_kv_heads = self.cfg.num_kv_heads,
+                max_seq_len  = self.cfg.max_seq_len,
+                head_dim     = head_dim,
+                device       = device,
+                dtype        = dtype,
+            )
+            for _ in range(self.cfg.transformer_blocks)
+        ]
 
-    def forward(self,x):
-        B, T = x.shape
-        v_embed=self.val_embed(x)
-        pos = torch.arange(0, T, device=x.device)
-        pos_embed=self.pos_embed(pos)
-        x=v_embed+pos_embed
-        x=self.embed_drop(x)
-        for layer in self.tflayers:
-            x=layer(x)
-        x=self.fnorm(x)
-    
-        return self.out_head(x)
-    
-    def predict(self,idx,max_new_tokens,top_k=None,temp=1,eos_id=50256):
-        for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.cfg.context_size:]
-            with torch.no_grad():
-                logits=self(idx_cond)
-            logits = logits[:, -1, :]
-            logits=logits/temp
-            if top_k is not None:
-                topk_vals, topk_idx = torch.topk(logits, top_k)
-                filtered_logits = torch.full_like(logits, float('-inf'))
-                filtered_logits.scatter_(1, topk_idx, topk_vals)
-                probs = torch.softmax(filtered_logits, dim=-1)
-                next_token = torch.multinomial(probs, 1)
-                
-            else :
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-            
-            if eos_id is not None and next_token.item() == eos_id:
-                    idx = torch.cat((idx, next_token), dim=1)
-                    break
-            idx = torch.cat((idx, next_token), dim=1)
+    def reset_cache(self) -> None:
+        """
+        Zero all cache buffers and reset fill pointers to 0.
+        Call between independent generation requests with the same batch size.
+        Does nothing if no cache has been built yet.
+        """
+        if self.kv_caches is not None:
+            for cache in self.kv_caches:
+                cache.reset()
 
-        return idx
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,          # (b, T)
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Parameters
+        ----------
+        input_ids : (b, T)  — token ids
+        use_cache : bool
+            False → training / eval without cache (full causal mask, T tokens).
+            True  → generation; cache is auto-allocated on first call if needed.
+
+        Returns
+        -------
+        logits   : (b, T, vocabulary_size)
+        aux_loss : scalar tensor — sum of per-layer MoE load-balance losses
+        """
+        b, T = input_ids.shape
+
+        # ── Auto-allocate cache on first generation call ───────────────────
+        if use_cache and self.kv_caches is None:
+            self.build_cache(
+                batch_size = b,
+                device     = input_ids.device,
+                dtype      = self.embed.weight.dtype,
+            )
+
+        # ── Embedding + dropout ───────────────────────────────────────────────
+        x = self.drop(self.embed(input_ids))   # (b, T, d_model)
+
+        # ── Transformer layers ────────────────────────────────────────────────
+        total_aux_loss = torch.tensor(0.0, device=input_ids.device)
+
+        for i, layer in enumerate(self.layers):
+            cache = self.kv_caches[i] if use_cache else None
+            x, aux_loss = layer(x, kv_cache=cache)
+            total_aux_loss = total_aux_loss + aux_loss
+
+        # ── Output projection ─────────────────────────────────────────────────
+        x      = self.norm(x)
+        logits = self.out_head(x)   # (b, T, vocabulary_size)
+
+        return logits, total_aux_loss
+
+@torch.inference_mode()
+def generate(
+    model:          LLM,
+    prompt_ids:     torch.Tensor,       # (b, T_prompt)
+    max_new_tokens: int,
+    temperature:    float = 1.0,
+    top_k:          int   = 0,          # 0 = disabled
+    eos_token_id:   Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Autoregressive generation using KV cache.
+
+    Steps
+    -----
+    1. Prefill  — run the full prompt through the model to populate the cache.
+    2. Decode   — feed one token at a time, appending to the cache each step.
+
+    Parameters
+    ----------
+    model          : LLM (will be set to eval mode internally)
+    prompt_ids     : (b, T_prompt)
+    max_new_tokens : int
+    temperature    : float   > 1 = more random, < 1 = sharper
+    top_k          : int     if > 0, restrict sampling to top-k logits
+    eos_token_id   : int | None   stop early when all sequences emit EOS
+
+    Returns
+    -------
+    generated : (b, T_prompt + max_new_tokens)  — prompt + new tokens
+    """
+    model.eval()
+    model.reset_cache()
+
+    device    = prompt_ids.device
+    generated = prompt_ids.clone()         # (b, T_prompt)
+
+    # ── Prefill ────────────────────────────────────────────────────────────
+    # Process the whole prompt; keep only the last-position logits.
+    logits, _ = model(prompt_ids, use_cache=True)   # (b, T_prompt, V)
+    next_logits = logits[:, -1, :]                  # (b, V)
+
+    # ── Decode loop ────────────────────────────────────────────────────────
+    for _ in range(max_new_tokens):
+
+        # Sample / greedy from last-position logits
+        next_token = _sample(next_logits, temperature=temperature, top_k=top_k)  # (b, 1)
+        generated  = torch.cat([generated, next_token], dim=1)
+
+        # Early stopping
+        if eos_token_id is not None and (next_token == eos_token_id).all():
+            break
+
+        # Single-step decode — append one token, read back logits
+        logits, _   = model(next_token, use_cache=True)   # (b, 1, V)
+        next_logits = logits[:, -1, :]                    # (b, V)
+
+    return generated
 
 
+def _sample(
+    logits:      torch.Tensor,   # (b, V)
+    temperature: float,
+    top_k:       int,
+) -> torch.Tensor:               # (b, 1)
+    """Temperature + optional top-k sampling. Returns token ids (b, 1)."""
+    if temperature != 1.0:
+        logits = logits / temperature
 
-    
+    if top_k > 0:
+        # Zero out all logits below the k-th largest
+        values, _ = torch.topk(logits, top_k, dim=-1)
+        threshold  = values[:, -1].unsqueeze(-1)
+        logits     = logits.masked_fill(logits < threshold, float("-inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)   # (b, 1)

@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from typing import Optional
 
 try:
     import tiktoken
@@ -11,26 +10,24 @@ except Exception:
 
 @dataclass
 class ModelConfig:
-    # Shared
-    d_model:            int   = 1024
+    # Shared (~57M params total with weight tying, see below)
+    d_model:            int   = 256
     dropout:            float = 0.1
-    context_length:     int   = 2048
+    context_length:     int   = 512
     vocabulary_size:    int   = _VOCAB_SIZE
 
-    # Attention
-    num_heads:          int   = 32
-    transformer_blocks: int   = 12
-    num_kv_heads:       int   = 8
+    # Standard multi-head attention (head_dim = 256 // 8 = 32)
+    num_heads:          int   = 8
+    transformer_blocks: int   = 8
     qkv_bias:           bool  = False
     use_rope:           bool  = True
-    use_attention_bias: bool  = True
 
-    # MoE FFN
-    d_ff:               int   = 2048
-    num_experts:        int   = 32
-    top_k:              int   = 2
-    aux_loss_coef:      float = 1e-2
-    capacity_factor:    Optional[float] = 1.25
+    # Standard dense FFN (4x expansion)
+    d_ff:               int   = 1024
+
+    # Tie input embedding and output head (saves ~51M params
+    # with the 200k o200k_base vocab — required to stay <100M)
+    tie_word_embeddings: bool = True
 
     @property
     def max_seq_len(self) -> int:

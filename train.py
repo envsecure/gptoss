@@ -1,7 +1,7 @@
 """
 train.py
 ────────
-Trains the LLM (GQA + RoPE + MoE) on pre-tokenised TinyStories shards
+Trains the LLM (MHA + RoPE, dense FFN) on pre-tokenised FineWeb-Edu shards
 produced by  prepare_data.py.
 
 Quick start
@@ -79,12 +79,8 @@ def get_args():
     p.add_argument("--context_length",     type=int,   default=cfg.context_length)
     p.add_argument("--transformer_blocks", type=int,   default=cfg.transformer_blocks)
     p.add_argument("--num_heads",          type=int,   default=cfg.num_heads)
-    p.add_argument("--num_kv_heads",       type=int,   default=cfg.num_kv_heads)
     p.add_argument("--d_ff",               type=int,   default=cfg.d_ff)
-    p.add_argument("--num_experts",        type=int,   default=cfg.num_experts)
-    p.add_argument("--top_k",              type=int,   default=cfg.top_k)
     p.add_argument("--dropout",            type=float, default=cfg.dropout)
-    p.add_argument("--aux_loss_coef",      type=float, default=cfg.aux_loss_coef)
 
     args = p.parse_args()
     return args
@@ -312,9 +308,9 @@ def estimate_val_loss(model, val_loader, val_steps, device, ctx):
         except StopIteration: break
         x, y = x.to(device), y.to(device)
         with ctx:
-            logits, aux = model(x, use_cache=False)
-        losses.append((nn.functional.cross_entropy(
-            logits.view(-1, logits.size(-1)), y.view(-1)) + aux).item())
+            logits = model(x, use_cache=False)
+        losses.append(nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), y.view(-1)).item())
     model.train()
     return float(np.mean(losses)) if losses else float("nan")
 
@@ -337,7 +333,7 @@ def main():
     cfg = ModelConfig(
         context_length=args.context_length, d_model=args.d_model,
         transformer_blocks=args.transformer_blocks, num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads, num_experts=args.num_experts, top_k=args.top_k,
+        d_ff=args.d_ff, dropout=args.dropout,
     )
     model = LLM(cfg).to(device)
     if args.compile:
@@ -395,9 +391,9 @@ def main():
                 x, y = next(train_iter)
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
             with ctx:
-                logits, aux = model(x, use_cache=False)
-                ce  = nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
-                loss = (ce + aux) / args.grad_accum
+                logits = model(x, use_cache=False)
+                loss = nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)), y.view(-1)) / args.grad_accum
             scaler.scale(loss).backward()
             accum_loss += loss.item()
 

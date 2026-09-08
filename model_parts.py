@@ -1,9 +1,10 @@
-# model_parts.py
+# model_parts.py — standard dense Transformer blocks:
+# Multi-Head Attention + RoPE, dense FFN, RMSNorm pre-norm, KV cache.
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional
 from config_model import ModelConfig
 
 
@@ -14,22 +15,22 @@ from config_model import ModelConfig
 class LayerKVCache:
     def __init__(
         self,
-        batch_size:   int,
-        num_kv_heads: int,
-        max_seq_len:  int,
-        head_dim:     int,
-        device:       torch.device,
-        dtype:        torch.dtype = torch.float32,
+        batch_size:  int,
+        num_heads:   int,
+        max_seq_len: int,
+        head_dim:    int,
+        device:      torch.device,
+        dtype:       torch.dtype = torch.float32,
     ):
         self.max_seq_len  = max_seq_len
         self.seq_len: int = 0
 
         self.k_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
+            batch_size, num_heads, max_seq_len, head_dim,
             device=device, dtype=dtype,
         )
         self.v_cache = torch.zeros(
-            batch_size, num_kv_heads, max_seq_len, head_dim,
+            batch_size, num_heads, max_seq_len, head_dim,
             device=device, dtype=dtype,
         )
 
@@ -37,7 +38,7 @@ class LayerKVCache:
         self,
         new_k: torch.Tensor,
         new_v: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ):
         T_new = new_k.shape[2]
         end   = self.seq_len + T_new
         if end > self.max_seq_len:
@@ -57,38 +58,27 @@ class LayerKVCache:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Grouped Query Attention + RoPE  (KV-cache compatible)
+# Standard Multi-Head Attention + RoPE (KV-cache compatible)
 # ──────────────────────────────────────────────────────────────────────────────
 
-class GroupedQueryAttentionWithRoPE(nn.Module):
+class MultiHeadAttentionWithRoPE(nn.Module):
 
     def __init__(self, cfg: ModelConfig):
         super().__init__()
-        assert cfg.d_model % cfg.num_heads      == 0, "d_model must be divisible by num_heads"
-        assert cfg.num_heads % cfg.num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+        assert cfg.d_model % cfg.num_heads == 0, "d_model must be divisible by num_heads"
 
-        self.num_heads    = cfg.num_heads
-        self.num_kv_heads = cfg.num_kv_heads
-        self.num_groups   = cfg.num_heads // cfg.num_kv_heads
-        self.head_dim     = cfg.d_model // cfg.num_heads
-        self.d_out        = cfg.d_model
-        self.use_rope     = cfg.use_rope
-        self.use_attn_bias = cfg.use_attention_bias
+        self.num_heads = cfg.num_heads
+        self.head_dim  = cfg.d_model // cfg.num_heads
+        self.d_out     = cfg.d_model
+        self.use_rope  = cfg.use_rope
 
-        self.W_q      = nn.Linear(cfg.d_model, cfg.d_model,                       bias=cfg.qkv_bias)
-        self.W_k      = nn.Linear(cfg.d_model, cfg.num_kv_heads * self.head_dim,  bias=cfg.qkv_bias)
-        self.W_v      = nn.Linear(cfg.d_model, cfg.num_kv_heads * self.head_dim,  bias=cfg.qkv_bias)
+        self.W_q      = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.qkv_bias)
+        self.W_k      = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.qkv_bias)
+        self.W_v      = nn.Linear(cfg.d_model, cfg.d_model, bias=cfg.qkv_bias)
         self.out_proj = nn.Linear(cfg.d_model, cfg.d_model)
         self.dropout  = nn.Dropout(cfg.dropout)
 
-        if cfg.use_attention_bias:
-            self.attention_bias = nn.Parameter(
-                torch.zeros(1, cfg.num_heads, cfg.max_seq_len, cfg.max_seq_len)
-            )
-
         if cfg.use_rope:
-            # FIX: precompute for head_dim, NOT head_dim//2.
-            # _precompute_rope returns cos/sin of shape (max_seq_len, head_dim).
             cos, sin = self._precompute_rope(cfg.max_seq_len, self.head_dim)
             self.register_buffer("cos_cached", cos)   # (max_seq_len, head_dim)
             self.register_buffer("sin_cached", sin)
@@ -112,30 +102,18 @@ class GroupedQueryAttentionWithRoPE(nn.Module):
     @staticmethod
     def _apply_rotary_emb(
         x:   torch.Tensor,   # (b, H, T, D)
-        cos: torch.Tensor,   # (1, 1, T, D)  — already sliced & reshaped by caller
+        cos: torch.Tensor,   # (1, 1, T, D)
         sin: torch.Tensor,   # (1, 1, T, D)
     ) -> torch.Tensor:
-        """
-        Rotate-half RoPE.  cos/sin are already (1,1,T,D) — no re-chunking needed.
-        x is split into first-half / second-half along head_dim.
-        """
+        """Rotate-half RoPE. cos/sin are already (1,1,T,D)."""
         D = x.shape[-1]
         half = D // 2
-        # FIX: split on head_dim directly — no .chunk() on cos/sin
         x1 = x[..., :half]    # (b, H, T, D//2)
         x2 = x[..., half:]    # (b, H, T, D//2)
-        c  = cos[..., :half]   # (1, 1, T, D//2)
-        s  = sin[..., :half]   # (1, 1, T, D//2)
+        c  = cos[..., :half]  # (1, 1, T, D//2)
+        s  = sin[..., :half]  # (1, 1, T, D//2)
         return torch.cat([x1 * c - x2 * s,
                           x2 * c + x1 * s], dim=-1)
-
-    def _repeat_kv(self, kv: torch.Tensor) -> torch.Tensor:
-        """Expand (b, Hkv, S, D) → (b, H, S, D)."""
-        if self.num_groups == 1:
-            return kv
-        b, hkv, S, D = kv.shape
-        kv = kv[:, :, None, :, :].expand(b, hkv, self.num_groups, S, D)
-        return kv.reshape(b, hkv * self.num_groups, S, D)
 
     # ── forward ───────────────────────────────────────────────────────────────
 
@@ -147,14 +125,13 @@ class GroupedQueryAttentionWithRoPE(nn.Module):
 
         b, T, _ = x.shape
 
-        q = self.W_q(x).view(b, T, self.num_heads,    self.head_dim).transpose(1, 2)
-        k = self.W_k(x).view(b, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.W_v(x).view(b, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.W_q(x).view(b, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.W_k(x).view(b, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.W_v(x).view(b, T, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.use_rope:
             offset = kv_cache.seq_len if kv_cache is not None else 0
 
-            # FIX: guard against offset + T exceeding precomputed table
             max_pos = self.cos_cached.shape[0]
             if offset + T > max_pos:
                 raise ValueError(
@@ -162,7 +139,6 @@ class GroupedQueryAttentionWithRoPE(nn.Module):
                     f"> max_seq_len ({max_pos}). Increase context_length in ModelConfig."
                 )
 
-            # Slice exact T positions, then reshape for broadcasting
             cos = self.cos_cached[offset:offset + T]            # (T, D)
             sin = self.sin_cached[offset:offset + T]            # (T, D)
             cos = cos.unsqueeze(0).unsqueeze(0)                  # (1, 1, T, D)
@@ -176,17 +152,8 @@ class GroupedQueryAttentionWithRoPE(nn.Module):
         else:
             k_full, v_full = k, v
 
-        S = k_full.shape[2]
-
-        k_full = self._repeat_kv(k_full)
-        v_full = self._repeat_kv(v_full)
-
-        # (b, H, T, D) × (b, H, D, S) → (b, H, T, S)
+        # (b, H, T, D) x (b, H, D, S) -> (b, H, T, S)
         attn = torch.matmul(q, k_full.transpose(-2, -1)) / (self.head_dim ** 0.5)
-
-        if self.use_attn_bias:
-            row_start = S - T
-            attn = attn + self.attention_bias[:, :, row_start:row_start + T, :S]
 
         if kv_cache is None:
             causal = torch.triu(
@@ -203,10 +170,10 @@ class GroupedQueryAttentionWithRoPE(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Expert
+# Standard dense feed-forward
 # ──────────────────────────────────────────────────────────────────────────────
 
-class Expert(nn.Module):
+class FeedForward(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.fc1  = nn.Linear(cfg.d_model, cfg.d_ff)
@@ -218,106 +185,23 @@ class Expert(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Router
-# ──────────────────────────────────────────────────────────────────────────────
-
-class TopKRouter(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.num_experts = cfg.num_experts
-        self.top_k       = cfg.top_k
-        self.W_r = nn.Linear(cfg.d_model, cfg.num_experts, bias=False)
-
-    def forward(self, x: torch.Tensor):
-        router_probs = F.softmax(self.W_r(x), dim=-1)            # (N, E)
-        gate_weights, expert_idx = torch.topk(router_probs, self.top_k, dim=-1)
-        gate_weights = gate_weights / gate_weights.sum(dim=-1, keepdim=True)
-        return gate_weights, expert_idx, router_probs
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Load-balance auxiliary loss
-# ──────────────────────────────────────────────────────────────────────────────
-
-def load_balance_loss(
-    router_probs: torch.Tensor,
-    expert_idx:   torch.Tensor,
-    num_experts:  int,
-) -> torch.Tensor:
-    one_hot    = F.one_hot(expert_idx, num_classes=num_experts).float()
-    token_mask = one_hot.sum(dim=1).clamp(max=1.0)
-    f = token_mask.mean(dim=0)
-    P = router_probs.mean(dim=0)
-    return num_experts * (f * P).sum()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# MoE FFN layer
-# ──────────────────────────────────────────────────────────────────────────────
-
-class MoELayer(nn.Module):
-    def __init__(self, cfg: ModelConfig):
-        super().__init__()
-        self.cfg     = cfg
-        self.router  = TopKRouter(cfg)
-        self.experts = nn.ModuleList([Expert(cfg) for _ in range(cfg.num_experts)])
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        b, T, d = x.shape
-        N = b * T
-        x_flat = x.view(N, d)
-
-        gate_weights, expert_idx, router_probs = self.router(x_flat)
-
-        aux_loss = self.cfg.aux_loss_coef * load_balance_loss(
-            router_probs, expert_idx, self.cfg.num_experts
-        )
-
-        capacity = (
-            max(int(self.cfg.capacity_factor * N / self.cfg.num_experts), 1)
-            if (self.cfg.capacity_factor is not None and self.training)
-            else N
-        )
-
-        out_flat = torch.zeros_like(x_flat)
-        for expert_id, expert in enumerate(self.experts):
-            token_mask, slot_idx = torch.where(expert_idx == expert_id)
-            if token_mask.numel() == 0:
-                continue
-            if token_mask.numel() > capacity:
-                token_mask = token_mask[:capacity]
-                slot_idx   = slot_idx[:capacity]
-            w          = gate_weights[token_mask, slot_idx]
-            expert_out = expert(x_flat[token_mask])
-            out_flat.index_add_(0, token_mask, expert_out * w.unsqueeze(-1))
-
-        return out_flat.view(b, T, d), aux_loss
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Transformer block
+# Transformer block (pre-norm with RMSNorm)
 # ──────────────────────────────────────────────────────────────────────────────
 
 class Transformer(nn.Module):
     def __init__(self, cfg: ModelConfig):
         super().__init__()
         self.norm1 = nn.RMSNorm(cfg.d_model)
-        self.gqa   = GroupedQueryAttentionWithRoPE(cfg)
+        self.attn  = MultiHeadAttentionWithRoPE(cfg)
         self.norm2 = nn.RMSNorm(cfg.d_model)
-        self.moe   = MoELayer(cfg)
+        self.ffn   = FeedForward(cfg)
 
     def forward(
         self,
         x:        torch.Tensor,
         kv_cache: Optional[LayerKVCache] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
-        residual = x
-        x = self.gqa(self.norm1(x), kv_cache=kv_cache)
-        x = residual + x
-
-        residual = x
-        moe_out, aux_loss = self.moe(self.norm2(x))
-        x = residual + moe_out
-
-        return x, aux_loss
+        x = x + self.attn(self.norm1(x), kv_cache=kv_cache)
+        x = x + self.ffn(self.norm2(x))
+        return x

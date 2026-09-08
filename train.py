@@ -43,6 +43,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm  # notebook widgets in Jupyter, console bar otherwise
 
 from config_model import ModelConfig
 from model import LLM
@@ -303,7 +304,7 @@ def estimate_val_loss(model, val_loader, val_steps, device, ctx):
     model.eval()
     losses = []
     it = iter(val_loader)
-    for _ in range(val_steps):
+    for _ in tqdm(range(val_steps), desc="validating", unit="batch", leave=False):
         try: x, y = next(it)
         except StopIteration: break
         x, y = x.to(device), y.to(device)
@@ -374,7 +375,10 @@ def main():
     # Tokens processed per optimiser step (grad_accum micro-batches × batch × seq)
     tokens_per_step: int = args.grad_accum * args.batch_size * args.context_length  # ← NEW
 
-    for step in range(start_step, args.max_steps):
+    pbar = tqdm(range(start_step, args.max_steps),
+                initial=start_step, total=args.max_steps,
+                desc="training", unit="step")
+    for step in pbar:
 
         lr = get_lr(step, args)
         for pg in optimizer.param_groups:
@@ -404,6 +408,8 @@ def main():
         running_loss += accum_loss
 
         total_tokens += tokens_per_step   # ← NEW: increment after every optimiser step
+        pbar.set_postfix({"loss": f"{accum_loss:.4f}", "lr": f"{lr:.1e}",
+                          "tokens": f"{total_tokens/1e6:.1f}M"})
 
         # ── Log + record train metrics ────────────────────────────────────────
         if (step + 1) % args.log_interval == 0:
@@ -412,11 +418,11 @@ def main():
             avg_loss = running_loss / args.log_interval
             ppl      = math.exp(min(avg_loss, 20))
 
-            print(f"step {step+1:>7,}/{args.max_steps:,}  "
-                  f"loss={avg_loss:.4f}  ppl={ppl:.1f}  "
-                  f"lr={lr:.2e}  tok/s={tps:,.0f}  "
-                  f"tokens={total_tokens/1e6:.2f}M  "   # ← NEW in log line
-                  f"{elapsed:.1f}s")
+            pbar.write(f"step {step+1:>7,}/{args.max_steps:,}  "
+                       f"loss={avg_loss:.4f}  ppl={ppl:.1f}  "
+                       f"lr={lr:.2e}  tok/s={tps:,.0f}  "
+                       f"tokens={total_tokens/1e6:.2f}M  "   # ← NEW in log line
+                       f"{elapsed:.1f}s")
 
             metrics.record_train(step + 1, avg_loss, lr, tps, total_tokens)  # ← passes tokens
             running_loss = 0.0
@@ -427,7 +433,7 @@ def main():
             val_loss = estimate_val_loss(model, val_loader, args.val_steps, device, ctx)
             val_ppl  = math.exp(min(val_loss, 20))
             tag      = " ★ new best" if val_loss < best_val else ""
-            print(f"  val_loss={val_loss:.4f}  val_ppl={val_ppl:.1f}{tag}")
+            pbar.write(f"  val_loss={val_loss:.4f}  val_ppl={val_ppl:.1f}{tag}")
 
             metrics.record_val(step + 1, val_loss)
 

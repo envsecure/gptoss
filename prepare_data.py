@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import tiktoken
 from datasets import load_dataset
-from tqdm import tqdm
+from tqdm.auto import tqdm  # notebook widgets in Jupyter, console bar otherwise
 
 # ── defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_DATASET          = "HuggingFaceFW/fineweb-edu"
@@ -134,36 +134,50 @@ def main():
 
     # Val docs that arrive after the val cap is hit overflow into train so no
     # tokens are wasted; training stops once both caps are reached.
-    pbar = tqdm(desc="  tokenising fineweb-edu", unit="doc")
+    # The stream length is unknown, so progress/ETA is tracked against the
+    # known token caps (max_train + max_val) instead of doc count.
+    tok_total = max_train + max_val
+    pbar = tqdm(total=tok_total, desc="tokenising fineweb-edu",
+                unit="tok", unit_scale=True)
     n_docs = 0
     for example in ds:
         text = example.get("text", "")
         if not text:
             continue
         n_docs += 1
-        pbar.update(1)
 
         ids = enc.encode_ordinary(text)
         ids.append(eos_id)
         arr = np.array(ids, dtype=np.uint32)
 
+        added = 0
         to_val = rng.random() < args.val_ratio
         if to_val and val_w.total_tokens + val_w.ptr < max_val:
             # may straddle the cap — trim to exactly max_val
             remaining = max_val - (val_w.total_tokens + val_w.ptr)
-            val_w.add(arr[:remaining] if len(arr) > remaining else arr)
+            chunk = arr[:remaining] if len(arr) > remaining else arr
+            val_w.add(chunk)
+            added = len(chunk)
         elif train_w.total_tokens + train_w.ptr < max_train:
             remaining = max_train - (train_w.total_tokens + train_w.ptr)
-            train_w.add(arr[:remaining] if len(arr) > remaining else arr)
+            chunk = arr[:remaining] if len(arr) > remaining else arr
+            train_w.add(chunk)
+            added = len(chunk)
         elif val_w.total_tokens + val_w.ptr < max_val:
             # train full but val still short: overflow val-assigned docs here
             remaining = max_val - (val_w.total_tokens + val_w.ptr)
-            val_w.add(arr[:remaining] if len(arr) > remaining else arr)
+            chunk = arr[:remaining] if len(arr) > remaining else arr
+            val_w.add(chunk)
+            added = len(chunk)
 
-        if n_docs % 1000 == 0:
+        if added:
+            pbar.update(added)
+
+        if n_docs % 200 == 0:
             pbar.set_postfix({
-                "train": f"{train_w.total_tokens + train_w.ptr:,}",
-                "val": f"{val_w.total_tokens + val_w.ptr:,}",
+                "docs": f"{n_docs:,}",
+                "train_M": f"{(train_w.total_tokens + train_w.ptr) / 1e6:.1f}",
+                "val_M": f"{(val_w.total_tokens + val_w.ptr) / 1e6:.2f}",
             })
 
         if (train_w.total_tokens + train_w.ptr >= max_train

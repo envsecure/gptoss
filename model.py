@@ -5,6 +5,20 @@ from typing import List, Optional
 from config_model import ModelConfig
 from model_parts import Transformer, LayerKVCache
 
+# Optional TPU support — no-op when torch_xla is not installed.
+try:
+    import torch_xla.core.xla_model as xm
+    _USE_XLA = True
+except ImportError:
+    xm = None
+    _USE_XLA = False
+
+
+def _xla_mark_step(t: torch.Tensor) -> None:
+    """Flush the lazy XLA graph so TPU work actually executes each step."""
+    if _USE_XLA and t.device.type == "xla":
+        xm.mark_step()
+
 
 class LLM(nn.Module):
     """
@@ -126,7 +140,7 @@ class LLM(nn.Module):
 
         return logits
 
-@torch.inference_mode()
+@torch.no_grad()  # no_grad (not inference_mode): in-place KV-cache writes are illegal on XLA inference tensors
 def generate(
     model:          LLM,
     prompt_ids:     torch.Tensor,       # (b, T_prompt)
@@ -152,6 +166,7 @@ def generate(
 
     # ── Prefill ────────────────────────────────────────────────────────────
     logits = model(prompt_ids, use_cache=True)   # (b, T_prompt, V)
+    _xla_mark_step(logits)
     next_logits = logits[:, -1, :]               # (b, V)
 
     # ── Decode loop ────────────────────────────────────────────────────────
@@ -164,6 +179,7 @@ def generate(
             break
 
         logits      = model(next_token, use_cache=True)   # (b, 1, V)
+        _xla_mark_step(logits)
         next_logits = logits[:, -1, :]                    # (b, V)
 
     return generated

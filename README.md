@@ -229,6 +229,22 @@ python predict.py --ckpt checkpoints/step_0010000.pt --prompt "The dragon"
 | `--weight_decay` | 0.1 | AdamW weight decay |
 | `--dtype` | `bfloat16` | Training precision (`float32` / `float16` / `bfloat16`) |
 | `--compile` | `false` | Enable `torch.compile` graph compilation |
+| `--device` | `auto` | `auto` (CUDA > TPU > CPU) / `cpu` / `cuda` / `xla` |
+
+### Training on a TPU
+
+Install a `torch_xla` build matching your torch version, then:
+
+```bash
+pip install torch-xla  # on a TPU VM; version must match torch
+python train.py --device xla --dtype bfloat16 --batch_size 8 --grad_accum 8 --max_steps 45776
+```
+
+Notes:
+* Tokenisation (`prepare_data.py`) always runs on CPU — TPUs can't accelerate BPE.
+* `--compile` is auto-skipped on XLA (XLA compiles graphs natively); `bfloat16` is the native TPU dtype.
+* Single-TPU-device training; multi-core `spawn` is not implemented yet.
+* Checkpoints are portable — a TPU-trained `.pt` loads on CUDA/CPU via `predict.py` auto device detection.
 
 ---
 

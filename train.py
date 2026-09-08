@@ -45,8 +45,38 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm  # notebook widgets in Jupyter, console bar otherwise
 
+# Optional TPU support — guarded so CUDA/CPU runs are unaffected when
+# torch_xla is not installed.
+try:
+    import torch_xla.core.xla_model as xm
+    from torch_xla.distributed.parallel_loader import MpDeviceLoader
+    USE_XLA = True
+except ImportError:
+    xm = None
+    MpDeviceLoader = None
+    USE_XLA = False
+
 from config_model import ModelConfig
 from model import LLM
+
+
+def resolve_device(requested: str) -> torch.device:
+    """Pick cpu/cuda/xla. 'auto' prefers CUDA, then TPU (if usable), then CPU."""
+    if requested == "cuda" or (requested == "auto" and torch.cuda.is_available()):
+        return torch.device("cuda")
+    if requested == "xla" or requested == "auto":
+        if USE_XLA:
+            try:
+                return xm.xla_device()
+            except Exception as e:
+                if requested == "xla":
+                    raise RuntimeError(
+                        "TPU requested but no XLA device found. "
+                        "On a TPU VM, ensure torch_xla matches your torch version.") from e
+                print(f"  (no XLA device: {e} — falling back)")
+    if requested not in ("auto", "cpu", "cuda"):
+        return torch.device(requested)  # e.g. "mps"
+    return torch.device("cpu")
 
 def get_args():
     # Start from config defaults
@@ -74,6 +104,9 @@ def get_args():
     p.add_argument("--dtype",          default="bfloat16",
                    choices=["float32", "float16", "bfloat16"])
     p.add_argument("--seed",           type=int,   default=42)
+    p.add_argument("--device",         default="auto",
+                   help="auto (CUDA > TPU > CPU) / cpu / cuda / xla. "
+                        "Needs torch_xla installed for xla.")
 
     # ── ModelConfig fields — defaults pulled live from the dataclass ──────────
     p.add_argument("--d_model",            type=int,   default=cfg.d_model)
@@ -266,10 +299,11 @@ def get_lr(step, args):
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
 def save_checkpoint(step, model, optimizer, val_loss, cfg,
-                    ckpt_dir, metrics, graph_dir):
+                    ckpt_dir, metrics, graph_dir, device):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / f"step_{step:07d}.pt"
-    torch.save({
+    saver = xm.save if device.type == "xla" else torch.save
+    saver({
         "step": step, "model": model.state_dict(),
         "optimizer": optimizer.state_dict(), "val_loss": val_loss,
         "cfg": {k: v for k, v in cfg.__dict__.items() if not k.startswith("_")},
@@ -317,7 +351,8 @@ def estimate_val_loss(model, val_loader, val_steps, device, ctx):
 
 def main():
     args      = get_args()
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device    = resolve_device(args.device)
+    is_xla    = device.type == "xla"
     graph_dir = Path(args.graph_dir)
     ckpt_dir  = Path(args.ckpt_dir)
     graph_dir.mkdir(parents=True, exist_ok=True)
@@ -326,10 +361,13 @@ def main():
     ptdtype = {"float32": torch.float32,
                "float16": torch.float16,
                "bfloat16": torch.bfloat16}[args.dtype]
-    use_amp = args.dtype != "float32" and device.type == "cuda"
+    # AMP where supported (CUDA + XLA/bfloat16). GradScaler is CUDA-float16-only;
+    # on XLA / CPU / float32 the scaler stays None and plain backward is used.
+    use_amp = args.dtype != "float32" and device.type in ("cuda", "xla")
     ctx     = (torch.autocast(device_type=device.type, dtype=ptdtype) if use_amp
-               else torch.amp.autocast(device_type=device.type, enabled=False))
-    scaler  = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+               else torch.amp.autocast(device_type="cpu", enabled=False))
+    scaler  = (torch.amp.GradScaler(enabled=True)
+               if (args.dtype == "float16" and device.type == "cuda") else None)
 
     cfg = ModelConfig(
         context_length=args.context_length, d_model=args.d_model,
@@ -338,7 +376,10 @@ def main():
     )
     model = LLM(cfg).to(device)
     if args.compile:
-        print("torch.compile …"); model = torch.compile(model)
+        if is_xla:
+            print("  (torch.compile skipped — XLA compiles graphs natively)")
+        else:
+            print("torch.compile …"); model = torch.compile(model)
 
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
     print(f"Model  : {n_params:.1f} M params | device={device} | dtype={args.dtype}")
@@ -359,6 +400,10 @@ def main():
                               persistent_workers=True)
     val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=2, pin_memory=True, drop_last=False)
+    if is_xla:
+        # Streams host batches to the TPU; required for good TPU utilisation.
+        train_loader = MpDeviceLoader(train_loader, device)
+        val_loader   = MpDeviceLoader(val_loader, device)
     print(f"Train: {len(train_ds):,} windows  |  Val: {len(val_ds):,} windows")
 
     start_step, best_val, metrics = load_latest(model, optimizer, ckpt_dir, device, graph_dir)
@@ -398,13 +443,25 @@ def main():
                 logits = model(x, use_cache=False)
                 loss = nn.functional.cross_entropy(
                     logits.view(-1, logits.size(-1)), y.view(-1)) / args.grad_accum
-            scaler.scale(loss).backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             accum_loss += loss.item()
 
-        scaler.unscale_(optimizer)
+        if scaler is not None:
+            scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        scaler.step(optimizer)
-        scaler.update()
+        if is_xla:
+            # TPU step: xm.optimizer_step replaces scaler.step/optimizer.step,
+            # mark_step flushes the lazy XLA graph for execution.
+            xm.optimizer_step(optimizer)
+            xm.mark_step()
+        elif scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         running_loss += accum_loss
 
         total_tokens += tokens_per_step   # ← NEW: increment after every optimiser step
@@ -448,14 +505,14 @@ def main():
                 metrics.record_val(step + 1, val_loss)
 
             save_checkpoint(step + 1, model, optimizer, val_loss,
-                            cfg, ckpt_dir, metrics, graph_dir)
+                            cfg, ckpt_dir, metrics, graph_dir, device)
 
     # ── Final ─────────────────────────────────────────────────────────────────
     val_loss = estimate_val_loss(model, val_loader, args.val_steps, device, ctx)
     if not metrics.val_steps or metrics.val_steps[-1] != args.max_steps:
         metrics.record_val(args.max_steps, val_loss)
     save_checkpoint(args.max_steps, model, optimizer, val_loss,
-                    cfg, ckpt_dir, metrics, graph_dir)
+                    cfg, ckpt_dir, metrics, graph_dir, device)
     print(f"\n✓  Done.  val_loss={val_loss:.4f}  "
           f"val_ppl={math.exp(min(val_loss,20)):.1f}  "
           f"total_tokens={total_tokens/1e6:.2f}M")   # ← NEW in final summary

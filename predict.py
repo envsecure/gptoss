@@ -49,7 +49,7 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--temperature",    type=float, default=0.9)
     p.add_argument("--top_k",          type=int,   default=50,
                    help="top-k sampling (0 = full distribution)")
-    p.add_argument("--device",         default="",    help="auto-detect if blank")
+    p.add_argument("--device",         default="",    help="auto-detect if blank (cpu/cuda/mps/xla)")
     p.add_argument("--dtype",          default="bfloat16",
                    choices=["float32", "float16", "bfloat16"])
     return p.parse_args()
@@ -57,9 +57,21 @@ def get_args() -> argparse.Namespace:
 
 def detect_device(requested: str) -> torch.device:
     if requested:
+        if requested == "xla":  # --device xla needs torch_xla installed
+            import torch_xla.core.xla_model as xm
+            return xm.xla_device()
         return torch.device(requested)
+    # Auto: CUDA > TPU (if usable) > MPS > CPU
     if torch.cuda.is_available():
         return torch.device("cuda")
+    try:
+        import torch_xla.core.xla_model as xm
+        try:
+            return xm.xla_device()
+        except Exception:
+            pass
+    except ImportError:
+        pass
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
@@ -137,8 +149,8 @@ def main():
                "float16": torch.float16,
                "bfloat16": torch.bfloat16}[args.dtype]
 
-    # On CPU or MPS, fall back to float32 silently
-    if device.type != "cuda" and dtype != torch.float32:
+    # bfloat16 is native on CUDA and TPU; fall back to float32 elsewhere
+    if device.type not in ("cuda", "xla") and dtype != torch.float32:
         print(f"Note: {args.dtype} not supported on {device.type}; using float32.")
         dtype = torch.float32
 

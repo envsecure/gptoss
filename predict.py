@@ -1,7 +1,7 @@
 """
 predict.py
 ──────────
-Interactive text-generation script for the trained MoE-LLM.
+Interactive text-generation script for the trained LLM.
 
 Usage
 -----
@@ -42,7 +42,7 @@ from model import LLM, generate
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 def get_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate text with the MoE-LLM.")
+    p = argparse.ArgumentParser(description="Generate text with the LLM.")
     p.add_argument("--ckpt",           default="checkpoints/step_0000260.pt")
     p.add_argument("--prompt",         default="",     help="seed text; blank → REPL")
     p.add_argument("--max_new_tokens", type=int,   default=200)

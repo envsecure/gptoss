@@ -5,14 +5,14 @@
 <h1 align="center">gptoss</h1>
 
 <p align="center">
-  <b>A production-grade, from-scratch Decoder-Only Transformer (LLM) in PyTorch</b><br/>
-  <sub>Mixture-of-Experts · Grouped Query Attention · Rotary Position Embeddings · Native KV Caching</sub>
+  <b>A from-scratch Decoder-Only Transformer (LLM) in PyTorch</b><br/>
+  <sub>Multi-Head Attention · Rotary Position Embeddings · RMSNorm · Native KV Caching</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/PyTorch-2.x-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch"/>
-  <img src="https://img.shields.io/badge/GPU-NVIDIA%20H200-76B900?logo=nvidia&logoColor=white" alt="GPU"/>
-  <img src="https://img.shields.io/badge/Params-3.66B-blue" alt="Parameters"/>
+  <img src="https://img.shields.io/badge/GPU-CUDA-76B900?logo=nvidia&logoColor=white" alt="GPU"/>
+  <img src="https://img.shields.io/badge/Params-57.5M-blue" alt="Parameters"/>
   <img src="https://img.shields.io/badge/Tokenizer-tiktoken%20o200k__base-black?logo=openai&logoColor=white" alt="Tokenizer"/>
   <img src="https://img.shields.io/badge/License-MIT-green" alt="License"/>
 </p>
@@ -21,9 +21,9 @@
 
 ## Overview
 
-**gptoss** is an open-source, research-oriented implementation of a modern Large Language Model built entirely from scratch in PyTorch. It incorporates the same architectural innovations found in state-of-the-art LLMs — including **Sparse Mixture-of-Experts**, **Grouped Query Attention**, and **Rotary Positional Embeddings** — while remaining readable, hackable, and well-documented enough to learn from.
+**gptoss** is an open-source, research-oriented implementation of a modern Large Language Model built entirely from scratch in PyTorch. It uses a clean, standard dense Transformer — **Multi-Head Attention** with **Rotary Positional Embeddings**, a dense GELU feed-forward network, and **RMSNorm** pre-normalisation — while remaining readable, hackable, and well-documented enough to learn from.
 
-The model was trained on an **NVIDIA H200 GPU** (141 GB HBM3e memory, 4.8 TB/s memory bandwidth), purpose-built for accelerating large-scale generative AI workloads. The H200's massive memory capacity and bandwidth make it possible to train a 3.66 B-parameter MoE model entirely in-GPU, eliminating the bottlenecks that would otherwise require multi-GPU parallelism.
+The default configuration is a **~57.5 M-parameter** model (with tied input/output embeddings to stay compact under the 200 K-token `o200k_base` vocabulary) trained on **FineWeb-Edu**, a large-scale dataset of educational web text. It trains comfortably on a single consumer-grade CUDA GPU.
 
 ---
 
@@ -31,14 +31,16 @@ The model was trained on an **NVIDIA H200 GPU** (141 GB HBM3e memory, 4.8 TB/s m
 
 | Feature | Description |
 |---|---|
-| **Sparse Mixture-of-Experts (MoE)** | 32 experts per layer with top-2 gated routing and auxiliary load-balancing loss for even expert utilisation |
-| **Grouped Query Attention (GQA)** | 32 query heads mapped to 8 KV heads — 4× reduction in KV cache memory with negligible quality loss |
+| **Standard Multi-Head Attention** | Classic dense self-attention (8 heads, `head_dim` 32) — no GQA, no approximations |
+| **Dense Feed-Forward (GELU)** | Standard `Linear → GELU → Dropout → Linear` block with 4× expansion — no MoE |
 | **Rotary Position Embeddings (RoPE)** | Context-aware relative positional encoding via rotate-half; generalises to unseen sequence lengths |
-| **Native KV Caching** | Custom Prefill + Decode pipeline — prompt is processed in a single forward pass, then tokens are generated one-at-a-time with O(1) per-step attention cost |
-| **OpenAI Tiktoken (`o200k_base`)** | 200 K-token vocabulary used natively by GPT-4o / o-series models |
-| **Mixed-Precision Training** | Full AMP support (`bfloat16` / `float16`) with gradient scaling, maximising H200 Tensor Core throughput |
-| **`torch.compile` Ready** | One-flag graph compilation for significant training speedups |
 | **RMSNorm Pre-Norm** | Stable training with Root Mean Square Layer Normalisation applied before attention and FFN |
+| **Tied Word Embeddings** | Input embedding and output head share one matrix — saves ~51 M params under the 200 K vocabulary |
+| **Native KV Caching** | Custom Prefill + Decode pipeline — prompt is processed in a single forward pass, then tokens are generated one-at-a-time with O(1) per-step attention cost |
+| **FineWeb-Edu Data Pipeline** | Streaming tokenisation of `HuggingFaceFW/fineweb-edu` (`sample-10BT` by default) into memory-mapped `.npy` shards |
+| **OpenAI Tiktoken (`o200k_base`)** | 200 K-token vocabulary used natively by GPT-4o / o-series models |
+| **Mixed-Precision Training** | Full AMP support (`bfloat16` / `float16`) with gradient scaling for Tensor Core throughput |
+| **`torch.compile` Ready** | One-flag graph compilation for significant training speedups |
 | **Live Metrics & Plotting** | Dark-themed Matplotlib dashboards for Loss, Perplexity, LR schedule, Throughput, and Tokens Seen — generated automatically at every checkpoint |
 
 ---
@@ -56,24 +58,22 @@ The architecture follows a **Pre-Norm Decoder-Only Transformer** design:
 
 | Hyperparameter | Value |
 |---|---|
-| Embedding Dimension (`d_model`) | 1024 |
-| Context Length | 2048 tokens |
-| Transformer Blocks | 12 |
-| Query Heads | 32 |
-| KV Heads (GQA) | 8 |
-| MoE Experts | 32 |
-| Active Experts (Top-K) | 2 |
-| FFN Hidden Dim (`d_ff`) | 2048 |
+| Embedding Dimension (`d_model`) | 256 |
+| Context Length | 512 tokens |
+| Transformer Blocks | 8 |
+| Attention Heads | 8 (`head_dim` 32) |
+| FFN Hidden Dim (`d_ff`) | 1024 (4×) |
 | Vocabulary Size | 200,019 (`o200k_base`) |
-| **Total Parameters** | **3.66 B** |
+| Tied Embeddings | Yes (input = output head) |
+| **Total Parameters** | **~57.5 M** |
 
-> With 32 experts and top-2 routing, only ~6.25 % of expert parameters are activated per token, giving the model the capacity of a 3.66 B-param network while maintaining the compute cost of a much smaller dense model.
+> With the 200 K-token `o200k_base` vocabulary, the embedding matrix alone is ~51 M params at `d_model=256` — tying the input embedding and output head (instead of allocating it twice) is what keeps the model under 100 M.
 
 ---
 
-## 📊 Training Results (NVIDIA H200)
+## 📊 Training Results
 
-The model was trained on the [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset using an **NVIDIA H200 141 GB** GPU. Below are the live metrics captured during a 2,000-step training run.
+The model is trained on [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) (`sample-10BT` by default, streamed and capped via `--max_train_tokens` / `--max_val_tokens`). Below are example live metrics captured during training (plots refresh at every checkpoint).
 
 ### Loss Curve
 
@@ -97,13 +97,15 @@ Perplexity collapsed by **four orders of magnitude** — from >250,000 to **~10*
   <img src="public/latest_tokens_seen.png" alt="Total Tokens Seen" width="700"/>
 </p>
 
-The model consumed approximately **65 M tokens** across 2,000 steps with a linear throughput profile, confirming stable data pipeline performance on the H200's 4.8 TB/s HBM3e memory bus.
+The model consumes tokens with a linear throughput profile, confirming stable streaming data pipeline performance from FineWeb-Edu shards.
 
 ---
 
 ## 💬 Sample Generations
 
-After just 2,000 training steps (val loss = **2.2493**), the model produces coherent, contextually appropriate narratives:
+> **Note:** the samples and screenshots below are from the previous TinyStories checkpoint and will be refreshed once the FineWeb-Edu run converges. General text completion works the same way via `predict.py`:
+
+After just 2,000 training steps (val loss = **2.2493**), the previous checkpoint produced coherent, contextually appropriate narratives:
 
 <p align="center">
   <img src="public/Screenshot 2026-04-29 222019.png" alt="Generation: ben was playing with the ball" width="820"/>
@@ -146,26 +148,30 @@ at the ball and smiled. She was happy she could play with her friends again.
 ### Prerequisites
 
 - Python 3.8+
-- PyTorch 2.x+ (CUDA recommended)
-- NVIDIA GPU with ≥24 GB VRAM (H200 / A100 / H100 recommended for full-scale training)
+- PyTorch 2.x+ (CUDA recommended; the ~57 M model also trains on smaller GPUs)
+- HuggingFace access for streaming FineWeb-Edu (set `HF_TOKEN` for higher rate limits)
 
 ### Installation
 
 ```bash
-git clone https://github.com/yourusername/gptoss.git
+git clone https://github.com/envsecure/gptoss.git
 cd gptoss
 pip install torch tiktoken matplotlib numpy datasets tqdm
 ```
 
 ### 1. Prepare Data
 
-Tokenise and shard the TinyStories dataset into memory-mapped `.npy` files:
+Stream, tokenise, and shard the FineWeb-Edu dataset into `.npy` files:
 
 ```bash
+# Default: 100M train / 10M val tokens from sample-10BT
 python prepare_data.py
+
+# Larger run: 1B train tokens from the 100B-token pool
+python prepare_data.py --subset sample-100BT --max_train_tokens 1e9 --max_val_tokens 1e7
 ```
 
-This downloads the dataset from HuggingFace, tokenises with `o200k_base`, and writes shards to `data/train/` and `data/val/`.
+This streams the dataset from HuggingFace (no full download), tokenises with `o200k_base`, randomly splits docs into train/val, and writes shards to `data/train/` and `data/val/`.
 
 ### 2. Train
 
@@ -177,7 +183,7 @@ python train.py
 python train.py --batch_size 8 --max_steps 20000 --compile --dtype bfloat16
 
 # Override model architecture via CLI
-python train.py --d_model 2048 --transformer_blocks 24 --num_experts 64
+python train.py --d_model 512 --transformer_blocks 12 --num_heads 8 --d_ff 2048
 ```
 
 All hyperparameters (model and training) can be configured via `config_model.py` or overridden from the command line.
@@ -231,11 +237,11 @@ python predict.py --ckpt checkpoints/step_0010000.pt --prompt "The dragon"
 ```
 gptoss/
 ├── config_model.py     # ModelConfig dataclass — all architectural hyperparameters
-├── model_parts.py      # Core components: GQA+RoPE, MoE, KV Cache, Transformer block
+├── model_parts.py      # Core components: MHA+RoPE, dense FFN, KV Cache, Transformer block
 ├── model.py            # LLM class + autoregressive generate() function
 ├── train.py            # Full training loop with AMP, grad accumulation, metrics
 ├── predict.py          # Inference script (one-shot + interactive REPL)
-├── prepare_data.py     # TinyStories download, tokenisation, and sharding
+├── prepare_data.py     # FineWeb-Edu streaming, tokenisation, and sharding
 ├── test.py             # Model summary / parameter count utility
 ├── public/             # Architecture diagrams, training graphs, screenshots
 └── .gitignore
@@ -245,17 +251,13 @@ gptoss/
 
 ## 🖥️ Hardware
 
-This model was developed and trained on:
+At ~57.5 M params the model trains on a single GPU:
 
 | Component | Specification |
 |---|---|
-| **GPU** | NVIDIA H200 |
-| **GPU Memory** | 141 GB HBM3e |
-| **Memory Bandwidth** | 4.8 TB/s |
+| **GPU** | Any CUDA-capable GPU (consumer cards work; more VRAM = larger batches) |
 | **Precision** | BF16 / FP32 mixed |
 | **Framework** | PyTorch 2.x + `torch.compile` |
-
-The H200's 141 GB HBM3e capacity allows the entire 3.66 B-parameter model (weights + optimizer states + activations) to reside in a single GPU's memory, while the 4.8 TB/s bandwidth ensures the MoE routing and expert dispatch operations — which are inherently memory-bound — remain performant at scale.
 
 ---
 
@@ -263,11 +265,10 @@ The H200's 141 GB HBM3e capacity allows the entire 3.66 B-parameter model (weigh
 
 - [ ] Multi-GPU training with FSDP / DeepSpeed
 - [ ] Sliding Window Attention for extended context
-- [ ] Expert parallelism for efficient MoE scaling
 - [ ] RLHF / DPO alignment fine-tuning
 - [ ] GGUF / ONNX export for local inference
 - [ ] Flash Attention 2 integration
-- [ ] Larger dataset training (FineWeb, RedPajama)
+- [ ] Longer-context training (1024–2048 tokens)
 
 ---
 
@@ -277,9 +278,9 @@ If you use gptoss in your research or projects, please consider citing:
 
 ```bibtex
 @software{gptoss2026,
-  title   = {gptoss: Open-Source Decoder-Only Transformer with MoE},
+  title   = {gptoss: Open-Source Decoder-Only Transformer},
   year    = {2026},
-  url     = {https://github.com/yourusername/gptoss}
+  url     = {https://github.com/envsecure/gptoss}
 }
 ```
 
@@ -292,5 +293,5 @@ This project is open-source and available under the [MIT License](LICENSE).
 ---
 
 <p align="center">
-  <b>Built with ❤️ and PyTorch on NVIDIA H200</b>
+  <b>Built with ❤️ and PyTorch</b>
 </p>
